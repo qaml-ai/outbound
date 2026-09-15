@@ -274,6 +274,7 @@ WRITE
   outbound add <company> [--email=] [--name=] [--owner=] [--stage=] [--source=] [--upsert]
   outbound set [ids...]  [--stage=] [--owner=] [--next-action=] [--due=] [--expect-rev=N]
   outbound touch [ids...] --channel=email|linkedin|call|meeting|other [--note=] [--in]
+                                  --at=<iso-date> backdates it (for imported history)
   outbound rm [ids...]
   outbound import [--csv|--json] [--upsert]      reads stdin
 
@@ -495,6 +496,9 @@ async function main() {
         channel: flags.channel === true || !flags.channel ? 'other' : flags.channel,
         note: flags.note === true ? null : flags.note,
         direction: flags.in ? 'in' : 'out',
+        // --at backdates a touch, so imported history lands on the day it happened
+        // and --stale answers honestly straight after an import.
+        occurred_at: flags.at && flags.at !== true ? flags.at : undefined,
       };
       for (const id of ids) await api(`/api/prospects/${id}/touches`, { method: 'POST', body, cfg });
       process.stderr.write(`logged ${ids.length} touch${ids.length === 1 ? '' : 'es'}\n`);
