@@ -23,6 +23,18 @@ call instead of a tool call per row.
   get `outbound list ... | outbound set ...` in one call. The Worker API is plain JSON,
   so an MCP wrapper can go on top later without changing anything underneath.
 
+## Install
+
+```bash
+curl -fsSL https://outbound.<subdomain>.workers.dev/install | sh
+outbound login      # humans — browser, Google SSO
+outbound agent      # agents — prints the full contract in one read
+```
+
+The Worker serves the CLI it was deployed with, so an install can never disagree with
+the API it talks to, and the API url is baked in from the Worker's own origin. The
+`/install` and `/cli` paths need an Access bypass policy — see [docs/access.md](docs/access.md).
+
 ## Setup
 
 ```bash
@@ -64,6 +76,9 @@ outbound rm [ids...]
 outbound import [--csv|--json] [--upsert]      # stdin
 outbound export [--csv]
 outbound stats
+outbound schema                                # tables, columns, stages, channels
+outbound agent                                 # full contract for an AI agent
+outbound sql "SELECT ..." [--write]            # raw SQL; reads free, writes explicit
 ```
 
 Output flags: `--json`, `--ids`, `--csv`. Ids come from arguments, or from stdin when

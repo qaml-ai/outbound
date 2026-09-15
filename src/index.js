@@ -7,6 +7,8 @@
  * Access did not run, which we refuse rather than guess at.
  */
 
+import CLI_SOURCE from '../cli/outbound.mjs';
+
 const STAGES = [
   'new', 'researching', 'queued', 'contacted',
   'replied', 'meeting', 'opportunity', 'won', 'lost', 'passed',
@@ -34,6 +36,89 @@ const now = () => new Date().toISOString();
 const uid = () => crypto.randomUUID().replace(/-/g, '').slice(0, 16);
 
 const norm = (v) => (v === undefined || v === null || v === '' ? null : String(v).trim());
+
+// ---------------------------------------------------------------- sql
+
+const READ_VERBS = ['select', 'with', 'explain', 'pragma'];
+const WRITE_VERBS = ['insert', 'update', 'delete', 'replace'];
+
+/**
+ * Decide what a statement does, so reads can be free and writes deliberate.
+ * String literals and comments are blanked first so a quote or a `--` cannot
+ * hide the real verb or a second statement.
+ */
+function classifySql(sql) {
+  const bare = sql
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/"(?:[^"]|"")*"/g, '""')
+    .replace(/--[^\n]*/g, ' ')
+    .replace(/\/\*[\s\S]*?\*\//g, ' ')
+    .trim();
+
+  if (/;\s*\S/.test(bare)) {
+    return { error: 'one statement at a time — split these into separate calls' };
+  }
+
+  const verb = (bare.match(/^([a-z]+)/i)?.[1] || '').toLowerCase();
+  if (!verb) return { error: 'could not parse a statement' };
+
+  if (READ_VERBS.includes(verb)) return { verb, writes: false };
+  if (WRITE_VERBS.includes(verb)) return { verb, writes: true };
+
+  return {
+    error: `"${verb}" is not allowed here — schema changes go through migrations `
+      + '(npx wrangler d1 migrations), not the API',
+  };
+}
+
+// ---------------------------------------------------------------- install
+
+/**
+ * `curl -fsSL <worker>/install | sh`. Served without Access (see docs/access.md)
+ * so a new machine can bootstrap before it has credentials. Nothing secret is in
+ * here — the CLI is public on GitHub — and the API url is baked in from our own
+ * origin so nobody has to be told what it is.
+ */
+const INSTALL_SH = `#!/bin/sh
+set -e
+
+API="__ORIGIN__"
+BIN="$HOME/.local/bin"
+CFG="$HOME/.config/outbound"
+
+printf 'installing outbound from %s\\n' "$API"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "outbound needs node 18+ (try: brew install node)" >&2
+  exit 1
+fi
+
+mkdir -p "$BIN" "$CFG"
+curl -fsSL "$API/cli" -o "$BIN/outbound"
+chmod +x "$BIN/outbound"
+
+# Record the API url without clobbering any credentials already there.
+if [ -f "$CFG/config.json" ]; then
+  node -e 'const fs=require("fs"),p=process.argv[1],c=JSON.parse(fs.readFileSync(p,"utf8"));c.api=process.argv[2];fs.writeFileSync(p,JSON.stringify(c,null,2)+"\\n")' "$CFG/config.json" "$API"
+else
+  printf '{\\n  "api": "%s"\\n}\\n' "$API" > "$CFG/config.json"
+fi
+chmod 600 "$CFG/config.json"
+
+echo "installed $BIN/outbound"
+
+case ":$PATH:" in
+  *":$BIN:"*) ;;
+  *) echo ""
+     echo "$BIN is not on your PATH. Add it:"
+     echo "  echo 'export PATH=\\"\\$HOME/.local/bin:\\$PATH\\"' >> ~/.zshrc && exec zsh" ;;
+esac
+
+echo ""
+echo "next:"
+echo "  outbound login     # humans, opens a browser"
+echo "  outbound agent     # agents, prints the full contract"
+`;
 
 // ---------------------------------------------------------------- identity
 
@@ -249,6 +334,51 @@ async function route(request, env, who) {
   if (path === '/api/whoami') return json({ id: who.id, kind: who.kind });
 
 
+  // Raw SQL. Reads are open; writes need ?write=1; DDL is never allowed here —
+  // schema is the developers' job, through migrations and review, not a CLI call.
+  if (path === '/api/sql' && method === 'POST') {
+    const sql = norm(body.sql);
+    if (!sql) return fail(400, 'no sql given');
+
+    const verdict = classifySql(sql);
+    if (verdict.error) return fail(400, verdict.error);
+    if (verdict.writes && url.searchParams.get('write') !== '1') {
+      return fail(400, `"${verdict.verb}" modifies data — re-run with --write to confirm`);
+    }
+
+    try {
+      const res = await db.prepare(sql).bind(...(Array.isArray(body.params) ? body.params : [])).all();
+      return json({
+        rows: res.results ?? [],
+        count: (res.results ?? []).length,
+        changes: res.meta?.changes ?? 0,
+        wrote: verdict.writes,
+      });
+    } catch (e) {
+      return fail(400, `sql error: ${e.message}`);
+    }
+  }
+
+  // So an agent can read the shape of the database instead of guessing at it.
+  if (path === '/api/schema') {
+    const { results: tables } = await db.prepare(
+      `SELECT name, sql FROM sqlite_master
+       WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_%' ESCAPE '\\'
+       ORDER BY name`).all();
+
+    const out = [];
+    for (const t of tables) {
+      const { results: cols } = await db.prepare(`PRAGMA table_info(${t.name})`).all();
+      out.push({
+        table: t.name,
+        columns: cols.map((c) => ({
+          name: c.name, type: c.type, notnull: !!c.notnull, pk: !!c.pk, default: c.dflt_value,
+        })),
+      });
+    }
+    return json({ tables: out, stages: STAGES, channels: CHANNELS });
+  }
+
   if (path === '/api/stats') {
     const { results } = await db.prepare(
       'SELECT stage, COUNT(*) AS n FROM prospects GROUP BY stage ORDER BY n DESC').all();
@@ -329,6 +459,24 @@ async function route(request, env, who) {
 
 export default {
   async fetch(request, env, ctx) {
+    // Public bootstrap routes. Access is configured to bypass these paths; the
+    // check here means a misconfigured bypass cannot expose anything but these two.
+    const { pathname, origin } = new URL(request.url);
+
+    if (pathname === '/install') {
+      return new Response(INSTALL_SH.replace(/__ORIGIN__/g, origin), {
+        headers: { 'content-type': 'text/x-shellscript; charset=utf-8' },
+      });
+    }
+    if (pathname === '/cli') {
+      return new Response(CLI_SOURCE, {
+        headers: {
+          'content-type': 'text/javascript; charset=utf-8',
+          'content-disposition': 'attachment; filename="outbound"',
+        },
+      });
+    }
+
     let who;
     try {
       who = await identify(request, ctx);

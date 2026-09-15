@@ -68,6 +68,43 @@ Create the token under **Zero Trust → Access → Service Tokens**. The client 
 shown once. Put it in `~/.config/outbound/config.json` (mode 600) or
 `OUTBOUND_CLIENT_SECRET` — never in this repo.
 
+## The public bootstrap paths
+
+`curl <worker>/install | sh` has to work on a machine that has no credentials yet, so
+`/install` and `/cli` need to be reachable without signing in. Both serve only the CLI,
+which is already public on GitHub — no secrets, no data.
+
+Create a second Access application scoped to each path, with a bypass policy. A
+path-scoped application takes precedence over the app covering the whole hostname, so
+everything else stays protected:
+
+```bash
+ACC=<account-id>
+APP=$(curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps" \
+  --data '{"name":"outbound install (public)","type":"self_hosted",
+           "domain":"outbound.<subdomain>.workers.dev/install",
+           "app_launcher_visible":false}' | jq -r .result.id)
+
+curl -s -X POST -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$ACC/access/apps/$APP/policies" \
+  --data '{"name":"public","decision":"bypass","include":[{"everyone":{}}]}'
+```
+
+Repeat for `/cli`. In the dashboard the same thing is **Zero Trust → Access →
+Applications → Add → Self-hosted**, path `…/install`, with a single **Bypass /
+Everyone** policy.
+
+Verify:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' https://outbound.<subdomain>.workers.dev/install   # 200
+curl -s -o /dev/null -w '%{http_code}\n' https://outbound.<subdomain>.workers.dev/api/health # 302
+```
+
+If you would rather not loosen Access at all, skip the bypass and have people install
+from GitHub instead — the Worker's `/install` is a convenience, not a requirement.
+
 ## Human login from the CLI
 
 `outbound login` shells out to `cloudflared`, which opens a browser for the Google flow

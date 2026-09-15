@@ -5,6 +5,12 @@
   "compatibility_date": "2026-09-01",
   "observability": { "enabled": true },
 
+  // The Worker serves the CLI it was deployed with, so `curl .../install` can
+  // never hand out a build that disagrees with this API.
+  "rules": [
+    { "type": "Text", "globs": ["**/*.mjs"] }
+  ],
+
   "d1_databases": [
     {
       "binding": "DB",

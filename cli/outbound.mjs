@@ -167,6 +167,18 @@ function emit(rows, flags, cols) {
   table(rows, cols);
 }
 
+/** Columns for an arbitrary result set, e.g. whatever `outbound sql` returned. */
+const dynamicCols = (rows) =>
+  [...new Set(rows.flatMap((r) => Object.keys(r)))].map((k) => ({
+    label: k.toUpperCase(),
+    get: (r) => {
+      const v = r[k];
+      if (v === null || v === undefined) return '';
+      const s = String(v);
+      return s.length > 40 ? s.slice(0, 37) + '...' : s;
+    },
+  }));
+
 const LIST_COLS = [
   { label: 'ID', get: (r) => r.id },
   { label: 'COMPANY', get: (r) => (r.company || '').slice(0, 28) },
@@ -191,28 +203,96 @@ const fieldsFromFlags = (flags) => Object.fromEntries(
     .map(([f, col]) => [col, flags[f]]),
 );
 
-const HELP = `outbound — shared prospect database
+/** Everything an agent needs in one read, with the schema fetched live so it can't go stale. */
+const agentBrief = (s, me, cfg) => `# outbound — CRM contract for agents
 
-  outbound config <api-url>              point the CLI at your Worker
-  outbound login                         sign in through Cloudflare Access (Google)
-  outbound whoami                        show who the API thinks you are
+You are ${me.id} (${me.kind}) against ${cfg.api}.
 
-  outbound add <company> [--email=] [--name=] [--owner=] [--stage=] [--upsert]
-  outbound list [filters]                --stage= --owner= --q= --domain= --source=
-                                         --stale=7  (no touch in N days)  --due
-  outbound show <id>
-  outbound set [ids...] [--stage=] [--owner=] [--next-action=] [--due=] [--expect-rev=N]
-  outbound touch [ids...] --channel=email|linkedin|call|meeting|other [--note=] [--in]
-  outbound rm [ids...]
-  outbound import [--csv|--json] [--upsert]     reads stdin
-  outbound export [--csv]
-  outbound stats
+## Schema
+${s.tables.map((t) => `${t.table}(${t.columns.map((c) => c.name).join(', ')})`).join('\n')}
 
-Output:   --json   full JSON      --ids   bare ids, one per line      --csv
-Chaining: ids come from arguments, or from stdin when none are given.
+stages:   ${s.stages.join(' ')}
+channels: ${s.channels.join(' ')}
+
+## Composition — the reason this is a CLI and not an MCP server
+Reads emit ids with --ids, or JSON with --json. Writes take ids from argv, or from
+stdin when none are given. So a whole workflow is one bash call, not one call per row:
 
   outbound list --stage=replied --ids | outbound set --stage=meeting
-  outbound list --stale=14 --owner=miguel --ids | outbound touch --channel=email --note=bump
+  outbound list --stale=14 --owner=sam --ids | outbound touch --channel=email --note=bump
+  outbound sql "SELECT id FROM prospects WHERE domain LIKE '%.ai'" --ids | outbound set --owner=sam
+
+Counts go to stderr, ids to stdout, so pipes stay clean. Non-zero exit on failure;
+exit 2 specifically means a write was refused as stale.
+
+## SQL
+  outbound sql "SELECT stage, COUNT(*) FROM prospects GROUP BY stage"
+  outbound sql "UPDATE prospects SET owner = 'sam' WHERE owner IS NULL" --write
+
+Reads are free. Anything that modifies data needs --write. DDL is rejected — the
+schema belongs to the developers and changes through migrations, not through you.
+One statement per call.
+
+## Writing safely
+Other agents and three humans share this database. There are no transactions.
+
+- Creating a lead that may already exist: use --upsert. It dedupes on contact_email
+  and merges only the fields you pass, so it will not overwrite an existing owner.
+- Read-modify-write: pass --expect-rev=N from the row you read. If someone wrote
+  first the call fails with exit 2 instead of silently clobbering them. Re-read and retry.
+- Bulk work: prefer one SQL statement over a loop of updates.
+- Stay in your lane: filter by --owner when you can, so two agents do not collide.
+
+## Do not
+- Do not invent stages. The list above is the whole set.
+- Do not delete rows unless explicitly asked; prefer --stage=passed.
+- Do not put secrets in notes. Everything here is visible to the whole team.
+`;
+
+const HELP = `outbound — shared CRM for the team
+
+  AGENTS: run \`outbound agent\` for the full contract — live schema, composition
+  rules, and the concurrency rules for writing alongside other agents. One read,
+  everything you need. This page is the short version.
+
+SETUP
+  outbound config <api-url>       point the CLI at the Worker
+  outbound login                  humans: sign in via Cloudflare Access (Google)
+  outbound whoami                 who the API thinks you are
+                                  agents: set OUTBOUND_CLIENT_ID / _SECRET instead
+
+READ
+  outbound list [filters]         --stage= --owner= --q= --domain= --source=
+                                  --stale=N  (nothing logged in N days)
+                                  --due      (next action is due)
+  outbound show <id>              one record, with its touch history
+  outbound stats                  counts by stage
+  outbound schema                 tables, columns, valid stages and channels
+  outbound export [--csv]
+
+WRITE
+  outbound add <company> [--email=] [--name=] [--owner=] [--stage=] [--source=] [--upsert]
+  outbound set [ids...]  [--stage=] [--owner=] [--next-action=] [--due=] [--expect-rev=N]
+  outbound touch [ids...] --channel=email|linkedin|call|meeting|other [--note=] [--in]
+  outbound rm [ids...]
+  outbound import [--csv|--json] [--upsert]      reads stdin
+
+SQL
+  outbound sql "SELECT stage, COUNT(*) FROM prospects GROUP BY stage"
+  outbound sql "UPDATE prospects SET owner='sam' WHERE owner IS NULL" --write
+                                  reads are free; changing data needs --write
+
+OUTPUT
+  --json   full JSON        --ids   bare ids, one per line        --csv
+
+CHAINING — ids come from arguments, or from stdin when none are given
+  outbound list --stage=replied --ids | outbound set --stage=meeting
+  outbound list --stale=14 --ids | outbound touch --channel=email --note=bump
+  outbound sql "SELECT id FROM prospects WHERE domain LIKE '%.ai'" --ids | outbound set --owner=sam
+
+WRITING ALONGSIDE OTHERS
+  --upsert        dedupe on email; merges only the fields you pass
+  --expect-rev=N  refuse the write (exit 2) if someone changed the row first
 `;
 
 async function main() {
@@ -245,6 +325,42 @@ async function main() {
     }
 
     case 'whoami': console.log(JSON.stringify(await api('/api/whoami', { cfg }), null, 2)); return;
+
+    case 'sql': {
+      const q = positional.join(' ').trim() || (await readStdin()).trim();
+      if (!q) die('usage: outbound sql "SELECT * FROM prospects WHERE stage = \'replied\'"');
+      const res = await api(`/api/sql${flags.write ? '?write=1' : ''}`, { method: 'POST', body: { sql: q }, cfg });
+      if (flags.json) { console.log(JSON.stringify(res.rows, null, 2)); return; }
+      if (flags.ids) { for (const r of res.rows) console.log(r.id ?? Object.values(r)[0]); return; }
+      if (flags.csv) { console.log(toCsv(res.rows)); return; }
+      if (res.wrote) { process.stderr.write(`${res.changes} row${res.changes === 1 ? '' : 's'} changed\n`); return; }
+      table(res.rows, dynamicCols(res.rows));
+      return;
+    }
+
+    case 'schema': {
+      const s = await api('/api/schema', { cfg });
+      if (flags.json) { console.log(JSON.stringify(s, null, 2)); return; }
+      for (const t of s.tables) {
+        console.log(t.table);
+        for (const c of t.columns) {
+          const bits = [c.type || 'ANY', c.pk ? 'primary key' : '', c.notnull ? 'not null' : '']
+            .filter(Boolean).join(', ');
+          console.log(`  ${c.name.padEnd(16)} ${bits}`);
+        }
+        console.log('');
+      }
+      console.log(`stages:   ${s.stages.join(' ')}`);
+      console.log(`channels: ${s.channels.join(' ')}`);
+      return;
+    }
+
+    case 'agent': {
+      const s = await api('/api/schema', { cfg });
+      const me = await api('/api/whoami', { cfg });
+      console.log(agentBrief(s, me, cfg));
+      return;
+    }
 
     case 'stats': {
       const s = await api('/api/stats', { cfg });
