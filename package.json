@@ -1,0 +1,23 @@
+{
+  "name": "outbound",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Shared outbound prospect database on Cloudflare Workers + D1, with a pipeable CLI.",
+  "type": "module",
+  "bin": {
+    "outbound": "./cli/outbound.mjs"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 execute outbound --local --file=./schema.sql",
+    "db:remote": "wrangler d1 execute outbound --remote --file=./schema.sql"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "wrangler": "^4.131.2"
+  },
+  "license": "MIT"
+}

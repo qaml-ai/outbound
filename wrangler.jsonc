@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "outbound",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-01",
+  "observability": { "enabled": true },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "outbound",
+      "database_id": "2283d605-1956-44df-bf57-7c1be4a10062"
+    }
+  ],
+
+  // Cloudflare Access is enabled on the Worker itself (Workers & Pages -> outbound
+  // -> Settings -> Access), not configured here. This block only fakes an identity
+  // for `wrangler dev` so local runs have someone to attribute writes to.
+  "access": {
+    "dev": {
+      "aud": "outbound-dev",
+      "identity": { "email": "dev@local" }
+    }
+  }
+}
