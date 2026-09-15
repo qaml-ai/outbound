@@ -84,7 +84,7 @@ set -e
 
 API="__ORIGIN__"
 BIN="$HOME/.local/bin"
-CFG="$HOME/.config/outbound"
+CFG="\${XDG_CONFIG_HOME:-$HOME/.config}/outbound"
 
 printf 'installing outbound from %s\\n' "$API"
 
