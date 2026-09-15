@@ -293,6 +293,13 @@ CHAINING — ids come from arguments, or from stdin when none are given
 WRITING ALONGSIDE OTHERS
   --upsert        dedupe on email; merges only the fields you pass
   --expect-rev=N  refuse the write (exit 2) if someone changed the row first
+
+ADMIN (needs CLOUDFLARE_API_TOKEN with Access: Edit)
+  outbound token create <name>    mint a service token for CI or a server, and
+                                  scope an Access policy to it. Humans don't need
+                                  one — \`outbound login\` is enough, and an agent
+                                  on your machine reuses your session.
+  outbound token list
 `;
 
 async function main() {
@@ -325,6 +332,66 @@ async function main() {
     }
 
     case 'whoami': console.log(JSON.stringify(await api('/api/whoami', { cfg }), null, 2)); return;
+
+    // Admin-only, and gated naturally: it needs a Cloudflare API token with
+    // Access:Edit, which teammates neither have nor should. Humans never need a
+    // service token at all — `outbound login` is enough. This is for headless
+    // things: CI, servers, cron.
+    case 'token': {
+      const sub = positional[0];
+      if (sub !== 'create' && sub !== 'list') die('usage: outbound token create <name>   |   outbound token list');
+
+      const cfToken = process.env.CLOUDFLARE_API_TOKEN;
+      const account = process.env.CLOUDFLARE_ACCOUNT_ID || cfg.account_id;
+      if (!cfToken) die('set CLOUDFLARE_API_TOKEN (needs Access: Edit) — this command is for admins');
+      if (!account) die('set CLOUDFLARE_ACCOUNT_ID, or add "account_id" to ~/.config/outbound/config.json');
+
+      const cf = async (path, init = {}) => {
+        const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${account}${path}`, {
+          ...init,
+          headers: { authorization: `Bearer ${cfToken}`, 'content-type': 'application/json' },
+        });
+        const j = await r.json();
+        if (!j.success) die(`cloudflare: ${j.errors?.map((e) => e.message).join('; ') || r.status}`);
+        return j.result;
+      };
+
+      if (sub === 'list') {
+        const tokens = await cf('/access/service_tokens');
+        if (flags.json) { console.log(JSON.stringify(tokens, null, 2)); return; }
+        for (const t of tokens) console.log(`${t.client_id}  ${t.name}  expires ${t.expires_at ?? 'never'}`);
+        return;
+      }
+
+      const name = positional[1];
+      if (!name) die('usage: outbound token create <name>');
+
+      // Attach the policy to the app guarding our own API, not some other app.
+      const host = new URL(cfg.api).host;
+      const apps = await cf('/access/apps');
+      const app = apps.find((a) => a.domain === host || a.domain === `${host}/`);
+      if (!app) die(`no Access application covers ${host} — create one first (see docs/access.md)`);
+
+      const token = await cf('/access/service_tokens', {
+        method: 'POST',
+        body: JSON.stringify({ name, duration: flags.duration === true || !flags.duration ? '8760h' : flags.duration }),
+      });
+
+      await cf(`/access/apps/${app.id}/policies`, {
+        method: 'POST',
+        body: JSON.stringify({
+          name: `outbound: ${name}`,
+          decision: 'non_identity',
+          include: [{ service_token: { token_id: token.id } }],
+        }),
+      });
+
+      process.stderr.write(`created service token "${name}" and scoped a policy to it on "${app.name}".\n`);
+      process.stderr.write('The secret is shown once — store it now.\n\n');
+      console.log(`export OUTBOUND_CLIENT_ID=${token.client_id}`);
+      console.log(`export OUTBOUND_CLIENT_SECRET=${token.client_secret}`);
+      return;
+    }
 
     case 'sql': {
       const q = positional.join(' ').trim() || (await readStdin()).trim();
